@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Terminal</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #141414;
+      color: #d4d4d4;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      background: #1f1f1f;
+      border-bottom: 1px solid #333;
+      padding: 6px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    header h1 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #ccc;
+      letter-spacing: 0.4px;
+    }
+
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+    #status-label {
+      font-size: 11px;
+      color: #888;
+    }
+
+    .connected .dot  { background: #4caf50; }
+    .connecting .dot { background: #ffc107; }
+    .disconnected .dot { background: #f44336; }
+
+    .connected #status-label  { color: #4caf50; }
+    .connecting #status-label { color: #ffc107; }
+    .disconnected #status-label { color: #f44336; }
+
+    #reconnect-btn {
+      margin-left: auto;
+      background: #0078d4;
+      color: #fff;
+      border: none;
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      display: none;
+    }
+    #reconnect-btn:hover { background: #106ebe; }
+
+    #terminal-wrap {
+      flex: 1;
+      padding: 6px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #terminal {
+      flex: 1;
+    }
+  </style>
+</head>
+<body>
+  <header id="header" class="connecting">
+    <div class="dot"></div>
+    <h1>Remote Terminal</h1>
+    <span id="status-label">Connecting...</span>
+    <button id="reconnect-btn" onclick="connect()">Reconnect</button>
+  </header>
+  <div id="terminal-wrap">
+    <div id="terminal"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+
+  <script>
+    const header      = document.getElementById('header');
+    const statusLabel = document.getElementById('status-label');
+    const reconnectBtn = document.getElementById('reconnect-btn');
+
+    // ── Terminal setup ──────────────────────────────────────────────────────
+    const term = new Terminal({
+      theme: {
+        background:          '#141414',
+        foreground:          '#d4d4d4',
+        cursor:              '#aeafad',
+        cursorAccent:        '#141414',
+        selectionBackground: '#264f78',
+        black:   '#1a1a1a', brightBlack:   '#555',
+        red:     '#f44747', brightRed:     '#f44747',
+        green:   '#6a9955', brightGreen:   '#6a9955',
+        yellow:  '#dcdcaa', brightYellow:  '#dcdcaa',
+        blue:    '#569cd6', brightBlue:    '#569cd6',
+        magenta: '#c586c0', brightMagenta: '#c586c0',
+        cyan:    '#4ec9b0', brightCyan:    '#4ec9b0',
+        white:   '#d4d4d4', brightWhite:   '#ffffff',
+      },
+      fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
+      fontSize: 14,
+      lineHeight: 1.2,
+      cursorBlink: true,
+      scrollback: 10000,
+    });
+
+    const fitAddon      = new FitAddon.FitAddon();
+    const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    term.loadAddon(fitAddon);
+    term.loadAddon(webLinksAddon);
+    term.open(document.getElementById('terminal'));
+    fitAddon.fit();
+
+    // ── State ───────────────────────────────────────────────────────────────
+    let sessionId = null;
+    let evtSrc    = null;
+    let inputBuffer = [];   // buffer input until session is ready
+
+    // ── Status helpers ──────────────────────────────────────────────────────
+    function setStatus(state, text) {
+      header.className = state;
+      statusLabel.textContent = text;
+      reconnectBtn.style.display = state === 'disconnected' ? 'block' : 'none';
+    }
+
+    // ── Send input to server ────────────────────────────────────────────────
+    async function sendInput(data) {
+      if (!sessionId) { inputBuffer.push(data); return; }
+      // xterm sends \r for Enter; PowerShell needs \r\n
+      // xterm sends \x7f for Backspace; PowerShell needs \x08
+      const translated = data
+        .replace(/\r(?!\n)/g, '\r\n')
+        .replace(/\x7f/g, '\x08');
+      await fetch(`/input?session=${sessionId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: translated,
+      }).catch(() => {});
+    }
+
+    // ── Connect via SSE ─────────────────────────────────────────────────────
+    function connect() {
+      if (evtSrc) { evtSrc.close(); evtSrc = null; }
+      sessionId = null;
+
+      setStatus('connecting', 'Connecting...');
+      term.reset();
+
+      evtSrc = new EventSource('/terminal');
+
+      evtSrc.onmessage = (e) => {
+        let msg;
+        try { msg = JSON.parse(e.data); } catch { return; }
+
+        if (msg.type === 'session') {
+          sessionId = msg.id;
+          setStatus('connected', 'Connected');
+          term.focus();
+          // Flush buffered input
+          for (const d of inputBuffer) sendInput(d);
+          inputBuffer = [];
+
+        } else if (msg.type === 'output') {
+          term.write(msg.data);
+
+        } else if (msg.type === 'exit') {
+          term.writeln('\r\n\x1b[90m[shell exited — click Reconnect to start a new session]\x1b[0m');
+          setStatus('disconnected', 'Disconnected');
+          evtSrc.close();
+
+        } else if (msg.type === 'ping') {
+          // heartbeat — no action needed
+        }
+      };
+
+      evtSrc.onerror = () => {
+        setStatus('disconnected', 'Connection lost');
+        evtSrc.close();
+      };
+    }
+
+    // ── Terminal → server ───────────────────────────────────────────────────
+    term.onData(sendInput);
+
+    // ── Resize ──────────────────────────────────────────────────────────────
+    window.addEventListener('resize', () => fitAddon.fit());
+
+    // ── Cleanup on page unload ──────────────────────────────────────────────
+    window.addEventListener('beforeunload', () => {
+      if (sessionId) {
+        navigator.sendBeacon(`/close?session=${sessionId}`);
+      }
+    });
+
+    // ── Go ──────────────────────────────────────────────────────────────────
+    connect();
+  </script>
+</body>
+</html>
